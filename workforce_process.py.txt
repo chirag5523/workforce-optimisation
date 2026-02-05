@@ -1,0 +1,138 @@
+import pandas as pd
+import os
+import re
+import tkinter as tk
+from tkinter import filedialog
+from datetime import datetime
+
+# ==========================================
+# FOLDER SELECTION UI
+# ==========================================
+def select_folder(title_text):
+    root = tk.Tk()
+    root.withdraw()  # Hide the main tkinter window
+    root.attributes('-topmost', True)  # Bring folder dialog to front
+    folder_path = filedialog.askdirectory(title=title_text)
+    root.destroy()
+    return folder_path
+
+print("📂 Please select the source DATA folder...")
+DATA_PATH = select_folder("Select the 'Data' Folder containing monthly subfolders")
+
+if not DATA_PATH:
+    print("❌ No folder selected. Exiting script.")
+    exit()
+
+# Set output folder to the parent of the Data folder (or wherever you prefer)
+OUTPUT_PATH = os.path.dirname(DATA_PATH)
+
+# ==========================================
+# SCRIPT LOGIC
+# ==========================================
+
+# ✅ Detect subfolders (September onwards)
+try:
+    subfolders = [
+        f for f in os.listdir(DATA_PATH)
+        if os.path.isdir(os.path.join(DATA_PATH, f))
+        and re.match(r"^(\d+)\.", f)
+        and int(re.match(r"^(\d+)\.", f).group(1)) >= 9
+    ]
+except Exception as e:
+    print(f"❌ Error accessing directory: {e}")
+    exit()
+
+# Expected columns for consistency
+expected_columns = [
+    "Agent Name", "Team Name", "Due on Calls (Hours)", "Inbound", "Inbound Handled",
+    "Inbound Active Talk Time", "Inbound Active Talk Time (Hours)", "Outbound",
+    "Outbound Handled", "Outbound Talk Time", "Outbound Talk Time (Hours)",
+    "Avg Talk Time", "Avg Wrap Time", "Wrap Time", "Wrap Time (Hours)",
+    "Available Time", "Available Time (Hours)", "Talk Time", "Handle Time",
+    "Handle Time (Hours)", "Call Productivity (Talk+Wait)"
+]
+
+all_data = []
+summary_data = []
+
+print(f"🔍 Found {len(subfolders)} subfolders to process.\n")
+
+for subfolder in sorted(subfolders):
+    source_folder = os.path.join(DATA_PATH, subfolder)
+    file_count = 0
+    row_count = 0
+
+    for file in os.listdir(source_folder):
+        if file.startswith("WFO - Detailed Agent Report") and file.endswith(".xlsx"):
+            file_path = os.path.join(source_folder, file)
+            try:
+                # Read specific sheet
+                df = pd.read_excel(file_path, sheet_name="Agent Data", header=None)
+
+                # Locate header row dynamically
+                header_idx = df[df.apply(lambda row: row.astype(str).str.contains("Agent Name", case=False).any(), axis=1)].index
+                if len(header_idx) == 0:
+                    continue
+                
+                header_row = header_idx[0]
+                df.columns = df.iloc[header_row]
+                df = df.iloc[header_row + 1:].copy()
+
+                # Filter for rows with actual agent/team data
+                df = df[
+                    (df["Agent Name"].notna()) & (df["Agent Name"].astype(str).str.strip() != "") &
+                    (df["Team Name"].notna()) & (df["Team Name"].astype(str).str.strip() != "")
+                ]
+
+                # Data Cleaning
+                df = df[df["Agent Name"] != "Agent Name"]
+                for col in expected_columns:
+                    if col not in df.columns:
+                        df[col] = None
+                
+                if "Call Productivity (Talk+Wait)" not in df.columns:
+                    df["Call Productivity (Talk+Wait)"] = None
+
+                df["File Name"] = file
+                df["Source Folder"] = subfolder
+
+                # Date extraction from filename
+                match = re.search(r"(\d{4}\.\d{2}\.\d{2})", file)
+                df["File Date"] = datetime.strptime(match.group(1), "%Y.%m.%d").strftime("%d/%m/%Y") if match else None
+
+                all_data.append(df)
+                file_count += 1
+                row_count += len(df)
+                print(f"✅ Processed: {file}")
+
+            except Exception as e:
+                print(f"⚠️ Error processing {file}: {e}")
+
+    summary_data.append({"Subfolder": subfolder, "Files Extracted": file_count, "Rows Extracted": row_count})
+
+# Final Combination and Splitting by Category
+if all_data:
+    final_df = pd.concat(all_data, ignore_index=True)
+    category_col = "Call Productivity (Talk+Wait)"
+    
+    # Ensure category column is clean for grouping
+    final_df[category_col] = final_df[category_col].astype(str).str.strip()
+    categories = final_df[category_col].dropna().unique()
+    summary_df = pd.DataFrame(summary_data)
+
+    for cat in categories:
+        subset = final_df[final_df[category_col] == cat].copy()
+        
+        # Sanitize filename for Excel export
+        safe_name = re.sub(r'[\\/*?:"<>|]', "_", str(cat))
+        final_output = os.path.join(OUTPUT_PATH, f"Output_{safe_name}.xlsx")
+
+        with pd.ExcelWriter(final_output, engine="openpyxl") as writer:
+            subset.to_excel(writer, index=False, sheet_name="Data")
+            summary_df.to_excel(writer, index=False, sheet_name="Summary")
+        
+        print(f"💾 Saved category '{cat}' to {final_output}")
+
+    print("\n🎉 Done! All categories exported.")
+else:
+    print("\n⚠️ No data found to process.")
